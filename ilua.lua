@@ -1,16 +1,29 @@
-require 'luarocks.require'
 -- ilua.lua
 -- A more friendly Lua interactive prompt
--- doesn't need '='
--- will try to print out tables recursively, subject to the pretty_print_limit value.
+-- doesn't need '=', and will try to print out tables recursively.
+-- On Unix, will use readline.so if available.
 -- Steve Donovan, 2007
 --
+local usage = [[ilua -lLtTvsq (lua files)
+    -l load a library
+    -L load a library and bring into global namespace
+    -t <file> write transcript to file; ilua.log if not specified
+    -T write transcript to file of format ilua_yyyy_mm_dd_HH_MM.log
+    -s switch off strict mode (don't report undeclared globals)
+    -v be verbose
+    -q require standalone expressions to end with '?' (e.g, 23*1.5?)
+If a file called ilua-defs is on your library path, it will be loaded first.
+]]
+
+local print = print
 local pretty_print_limit = 20
 local max_depth = 7
 local table_clever = true
 local prompt = '> '
 local verbose = false
 local strict = true
+local que = false
+local use_lua_interactive = false
 -- suppress strict warnings
 _ = true
 
@@ -46,13 +59,23 @@ local function oprint(...)
     print(...)
 end
 
+local function is_map_like(tbl)
+	for k,v in pairs(tbl) do
+		if type(k) ~= 'number' then
+			return true
+		end
+	end
+	return false
+end
+
 local function join(tbl,delim,limit,depth)
     if not limit then limit = pretty_print_limit end
     if not depth then depth = max_depth end
     local n = #tbl
     local res = ''
     local k = 0
-    -- very important to avoid disgracing ourselves with circular referencs...
+    -- very important to avoid disgracing ourselves with circular references or 
+	-- excessively nested tables...
     if #jstack > depth then
         return "..."
     end
@@ -62,13 +85,15 @@ local function join(tbl,delim,limit,depth)
         end
     end
     push(jstack,tbl)
-    -- this is a hack to work out if a table is 'list-like' or 'map-like'
-    -- you can switch it off with ilua.table_options {clever = false}
-    local is_list
+    -- a table may have a 'list-like' part if it has a non-zero size
+	-- and may have have a 'map-like' part if it has non-numerical keys
+    -- you can switch off this cleverness with ilua.table_options {clever = false}
+    local is_list,is_map
     if table_clever then
-        local index1 = n > 0 and tbl[1]
-        local index2 = n > 1 and tbl[2]
-        is_list = index1 and index2
+		is_list = #tbl > 0
+		is_map = is_map_like(tbl)
+	else
+		is_map = true -- that is, treat all keys equally
     end
     if is_list then
         for i,v in ipairs(tbl) do
@@ -79,19 +104,22 @@ local function join(tbl,delim,limit,depth)
                 break
             end
         end
-    else
+    end
+	if is_map then
         for key,v in pairs(tbl) do
-            if type(key) == 'number' then
-                key = '['..tostring(key)..']'
-            else
-                key = tostring(key)
-            end
-            res = res..delim..key..'='..val2str(v)
-            k = k + 1
-            if k > limit then
-                res = res.." ... "
-                break
-            end
+			local num = type(key) == 'number'
+			key = tostring(key)
+			if not num or (num and not is_list) then
+				if num then
+					key = '['..key..']'
+				end
+				res = res..delim..key..'='..val2str(v)
+				k = k + 1
+				if k > limit then
+					res = res.." ... "
+					break
+				end
+			end
         end
     end
     pop(jstack)
@@ -135,13 +163,13 @@ function _pretty_print(...)
     _G['_'] = arg[1]
 end
 
-function compile(line)
+local function compile(line)
     if verbose then oprint(line) end
     local f,err = loadstring(line,'local')
     return err,f
 end
 
-function evaluate(chunk)
+local function evaluate(chunk)
     local ok,res = pcall(chunk)
     if not ok then
         return res
@@ -150,28 +178,33 @@ function evaluate(chunk)
 end
 
 function eval_lua(line)
-    if savef then
-        savef:write(prompt,line,'\n')
-    end
+    -- write to transcript, if open
+    if savef then savef:write(prompt,line,'\n') end
     -- is the line handler interested?
     if line_handler_fn then
-        line = line_handler_fn(line)
-        -- returning nil here means that the handler doesn't want
-        -- Lua to see the string
+        -- returning nil here means that the handler doesn't want Lua to see the string
+        line = line_handler_fn(line)        
         if not line then return end
     end
-    -- is it an expression?
-    local err,chunk = compile('_pretty_print('..line..')')
-    if err then
-        -- otherwise, a statement?
-        err,chunk = compile(line)
-    end
-    -- if compiled ok, then evaluate the chunk
+    local err,chunk
+    if not que then -- try compiling first as expression, then as statement
+        -- is it an expression?
+        err,chunk = compile('_pretty_print('..line..')')
+        if err then -- otherwise, a statement?         
+            err,chunk = compile(line)
+        end        
+    else -- expressions must be explicitly terminated with ?
+        if line:sub(-1,-1) == '?' then
+            err,chunk = compile('_pretty_print('..line..')')
+        else
+            err,chunk = compile(line)
+        end    
+    end    
     if not err then
+        -- we can now execute the chunk
         err = evaluate(chunk)
     end
-    -- if there was any error, print it out
-    if err then
+    if err then -- if there was any compile or runtime error,  print it out        
         oprint(err)
     end
 end
@@ -188,7 +221,7 @@ function ilua.precision(len,prec,all)
         num_prec = '%'..len..'.'..prec..'f'
     end
     num_all = all
-end  
+end	
 
 function ilua.table_options(t)
     if t.limit then pretty_print_limit = t.limit end
@@ -248,6 +281,7 @@ end
 -- anywhere.
 --
 local function set_strict()
+
     local mt = getmetatable(_G)
     if mt == nil then
         mt = {}
@@ -258,17 +292,21 @@ local function set_strict()
         local d = debug.getinfo(3, "S")
         return d and d.what or "C"
     end
+	
+	declared.__tostring = true
 
     mt.__newindex = function (t, n, v)
         declared[n] = true
         rawset(t, n, v)
     end
-
+      
     mt.__index = function (t, n)
         if not declared[n] and what() ~= "C" then
             local lookup = global_handler_fn and global_handler_fn(n)
             if not lookup then
-                error("variable '"..n.."' is not declared", 2)
+                --error("variable '"..tostring(n).."' is not declared", 2)
+				print("variable '"..tostring(n).."' is not declared")
+				return
             else
                 return lookup
             end
@@ -280,14 +318,14 @@ end
 
 --- Initial operations which may not succeed!
 -- try to bring in any ilua configuration file; don't complain if this is unsuccessful
-pcall(function()
-    require 'ilua-defs'
+pcall(function()        
+    require 'ilua-defs'    
 end)
 
 -- Unix readline support, if readline.so is available...
 local rl,readline,saveline
 err = pcall(function()
-    rl = require 'devtools.readline'
+    rl = require 'readline'  
     readline = rl.readline
     saveline = rl.add_history
 end)
@@ -302,12 +340,12 @@ end
 -- process command-line parameters
 if arg then
     local i = 1
-
+    
     local function parm_value(opt,parm,def)
         local val = parm:sub(3)
         if #val == 0 then
             i = i + 1
-            if i > #arg then
+            if i > #arg then 
                 if not def then
                     quit(-1,"expecting parameter for option '-"..opt.."'")
                 else
@@ -318,14 +356,14 @@ if arg then
         end
         return val
     end
-
+    
     while i <= #arg do
         local v = arg[i]
         local opt = v:sub(1,1)
         if opt == '-' then
-            opt = v:sub(2,2)     
+            opt = v:sub(2,2)			
             if opt == 'h' then
-                quit(0,"ilua (-l lib) (-L lib) (lua files)")
+                quit(0,usage)
             elseif opt == 'l' then
                 require (parm_value(opt,v))
             elseif opt == 'L' then
@@ -350,6 +388,10 @@ if arg then
                 strict = false
             elseif opt == 'v' then
                 verbose = true
+            elseif opt == 'q' then
+                que = true
+			elseif opt == 'i' then
+				use_lua_interactive = true
             end
         else -- a plain file to be executed immediately
             dofile(v)
@@ -358,24 +400,44 @@ if arg then
     end
 end
 
-print 'ILUA: Lua 5.1.2  Copyright (C) 1994-2007 Lua.org, PUC-Rio\n"quit" to end'
+require 'lfs'
 
--- any import complaints?
+function cd (path)
+    if not path then
+		print(lfs.currentdir())
+	else
+		lfs.chdir(path)
+	end
+end
+
+function dir (mask)
+    mask = mask or '*.*'
+	os.execute('dir /b '..mask)
+end
+    
 ilua.import()
 
 -- enable 'not declared' error
-if strict then
+if strict then 
     set_strict()
 end
 
-local line = readline(prompt)
-while line do
-    if line == 'quit' then break end
-    eval_lua(line)
-    saveline(line)
-    line = readline(prompt)
-end
+io.stdout:setvbuf 'no'
 
-if savef then
-    savef:close()
+if not use_lua_interactive then
+	print 'ILUA: Lua 5.1.2  Copyright (C) 1994-2007 Lua.org, PUC-Rio\n"quit" to end'
+	local line = readline(prompt)
+	while line do    
+		if line == 'quit' then break end
+		eval_lua(line)
+		saveline(line)
+		line = readline(prompt)
+	end
+
+	if savef then
+		savef:close()
+	end
+else
+	_G.print = _pretty_print
+    print 'quit to end; cd, dir and edit also available'
 end
